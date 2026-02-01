@@ -1,0 +1,16 @@
+[project]
+name = "EnemyBalancer"
+version = "1.0.46"
+description = "Nerfs enemy health&shield on respawn, preventing you from getting stuck while underleveled for example."
+[[project.authors]]
+name = "galqawala"
+
+[tool.sdkmod]
+name = "EnemyBalancer"
+supported_games = [ "BL1",]
+coop_support = "ClientSide"
+download = ""
+
+[tool.sdkmod.license]
+name = "GPL3"
+url = "https://choosealicense.com/licenses/gpl-3.0/"
