@@ -9,7 +9,7 @@ name = "galqawala"
 name = "EnemyBalancer"
 supported_games = [ "BL1",]
 coop_support = "ClientSide"
-download = ""
+download = "https://github.com/galqawala/EnemyBalancer/raw/refs/heads/main/EnemyBalancer.sdkmod"
 
 [tool.sdkmod.license]
 name = "GPL3"
