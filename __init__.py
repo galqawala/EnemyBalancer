@@ -1,120 +1,192 @@
-from mods_base import build_mod, get_pc, hook, SliderOption, BoolOption
-from unrealsdk.hooks import Type
-from unrealsdk import logging
+"""EnemyBalancer
+
+Each time your respawn dialog appears (i.e. each time you die), every
+currently alive enemy's health and shield is scaled down by a configurable
+percentage - so a fight that was killing you repeatedly gets a little easier
+each time, rather than staying exactly as hard.
+
+Works unchanged across BL1, BL2 and TPS. WillowMind.Pawn, Pawn.HealthPool
+(inherited from Engine.Pawn) and WillowPawn.ShieldArmor are declared
+identically in all three games' UnrealScript - confirmed directly against
+their decompiled sources rather than assumed, since BL1 (Willow1) and BL2/TPS
+(Willow2) are otherwise substantially different codebases. This particular
+mechanism happens to be shared engine-level plumbing.
+
+Also installed to BorderlandsGOTYEnhanced (BL1E in mods_base's Game enum - the
+64-bit "borderlandsgoty.exe" build, a separate value from BL1's 32-bit
+"borderlands.exe"). Its gameplay UnrealScript is understood to be the same
+WillowGame content as BL1 - Enhanced changed the native engine/renderer, not
+the scripted classes this mod touches - but that has not been independently
+confirmed against a decompiled BL1E dump the way BL1/BL2/TPS were.
+"""
+
 import unrealsdk
+from mods_base import SliderOption, build_mod, get_pc, hook
+from unrealsdk import logging
+from unrealsdk.hooks import Type
+
+nerf_percent = SliderOption(
+    "Health/Shield Multiplier (%)",
+    95,
+    1,
+    99,
+    1,
+    True,
+    description=(
+        "Each time you die, every currently alive enemy's health and shield"
+        " is multiplied by this percentage. Applies again, compounding, on"
+        " every later death."
+    ),
+)
 
 
-nerf_multiplier_pct = SliderOption("Health/Shield Multiplier (%)", 99, 1, 99, 1)
+def nerf_value(value, multiplier):
+    """The reduced stat value, or None if `value` is not numeric.
 
-
-def _safe_str(value) -> str:
+    The -1 after scaling guarantees the value strictly decreases even where
+    the multiplier alone would round back up to the original integer, and the
+    result is never allowed below 1.
+    """
     try:
-        return str(value)
-    except Exception:
-        return "<unprintable>"
+        numeric = float(value)
+    except (TypeError, ValueError):
+        return None
+    return max(1, int(numeric * multiplier) - 1)
 
 
-def _safe_float(value):
-    try:
-        return float(value)
-    except Exception:
+def nerf_resource_pool(pool_ref, multiplier):
+    """Scale one ResourcePoolReference's current and max value down in place.
+
+    Health and shield are the identical struct, so one function handles both
+    rather than repeating the same logic per stat.
+
+    Returns (old_current, old_max, new_current, new_max), or None if there was
+    nothing to nerf. Both current and max are scaled by the same multiplier,
+    so the current/max RATIO barely moves - an enemy whose health bar was full
+    stays visually full, just over a smaller pool. The bar cannot show this;
+    only the numbers logged here can.
+    """
+    data = getattr(pool_ref, "Data", None) if pool_ref is not None else None
+    if data is None:
         return None
 
+    old_current = data.GetCurrentValue()
+    old_max = data.GetMaxValue()
+    new_current = nerf_value(old_current, multiplier)
+    new_max = nerf_value(old_max, multiplier)
 
-def _nerf_value(value, multiplier):
-    numeric = _safe_float(value)
-    if numeric is None:
+    touched_max = bool(old_max) and new_max is not None
+    touched_current = bool(old_current) and new_current is not None
+    if not (touched_max or touched_current):
         return None
-    new_value = int(numeric * multiplier) - 1
-    if new_value < 1:
-        new_value = 1
-    return new_value
+
+    if touched_max:
+        data.MaxValue = new_max
+    if touched_current:
+        data.SetCurrentValue(new_current)
+
+    return old_current, old_max, new_current, new_max
+
+
+def iter_enemy_pawns():
+    """Every pawn currently under AI control, via WillowMind.Pawn."""
+    for mind in unrealsdk.find_all("WillowMind"):
+        pawn = mind.Pawn
+        if pawn is not None:
+            yield pawn
+
+
+def enemy_display_name(enemy) -> str:
+    """The enemy's actual name ("Skag", "Bandit"), not its shared UnrealScript
+    class name ("WillowAIPawn") - every enemy in a level is typically the same
+    class, distinguished only by its BalanceDefinitionState.
+
+    This is the same call the game itself uses for the name shown above an
+    enemy's health bar (WillowAIPawn.GetTransformedName, TargetName) - present
+    identically in BL1 and BL2/TPS. Falls back to the class name if a pawn
+    somehow has no balance definition (e.g. player-summoned allies).
+    """
+    state = getattr(enemy, "BalanceDefinitionState", None)
+    if state is not None:
+        definition = getattr(state, "BalanceDefinition", None)
+        if definition is not None:
+            try:
+                name = definition.GetDisplayNameAtGrade(state.GradeIndex)
+                if name:
+                    return str(name)
+            except Exception:  # noqa: BLE001
+                pass
+    return str(getattr(getattr(enemy, "Class", None), "Name", "?"))
+
+
+def enemy_level(enemy):
+    """The enemy's level, or None if it can't be read.
+
+    WillowPawn.GetGameStage() - identical across BL1, BL2 and TPS, and the
+    same quantity an item's own level is drawn from - is the closest thing to
+    a displayed enemy level; there is no separate "GameStageToPlayerLevel"
+    mapping in any of the three games' scripts.
+    """
+    try:
+        stage = int(enemy.GetGameStage())
+    except Exception:  # noqa: BLE001
+        return None
+    return stage if stage > 0 else None
 
 
 @hook("WillowGame.WillowHUD:ShowRespawnDialog", Type.POST)
-def on_show_respawn_dialog(obj, __args, __ret, __func):
-    logging.info("You died! Nerfing enemies...")
-
+def on_show_respawn_dialog(_obj, _args, _ret, _func):
+    # Nothing to do without a live player - this can fire during odd
+    # transitional states with no pawn possessed yet.
     pc = get_pc()
-    if not pc or not pc.Pawn:
+    if pc is None or pc.Pawn is None:
         return
-    
-    all_minds = unrealsdk.find_all("WillowMind")
-    enemies = [mind.Pawn for mind in all_minds if mind.Pawn]
-    
-    logging.info(f"Found {len(enemies)} enemies via WillowMind")
-    for enemy in enemies:
-        # Log basic object name
-        logging.info(f"Nerfing: {enemy}")
-        
-        # Try to get more descriptive name/type from the pawn or its AI controller
+
+    multiplier = nerf_percent.value / 100.0
+    seen = 0
+    nerfed = 0
+    for enemy in iter_enemy_pawns():
+        seen += 1
+        name = enemy_display_name(enemy)
         try:
-            def get_attr(obj, attr):
-                return _safe_str(getattr(obj, attr, "N/A"))
+            health = nerf_resource_pool(getattr(enemy, "HealthPool", None), multiplier)
+            shield = nerf_resource_pool(getattr(enemy, "ShieldArmor", None), multiplier)
+            if health is None and shield is None:
+                continue
+            nerfed += 1
 
-            logging.info(f"  Archetype: {get_attr(enemy, "ObjectArchetype")}")
-            
-            if hasattr(enemy, "ConsumerHandle") and enemy.ConsumerHandle:
-                 definition = get_attr(enemy.ConsumerHandle, "Definition")
-                 logging.info(f"  Definition: {definition}")
+            # One line per enemy: "health current/max -> current/max", the
+            # same for shield if present. Compact enough to read at a glance
+            # across a whole pack, rather than several lines per enemy.
+            parts = []
+            if health is not None:
+                oc, om, nc, nm = health
+                parts.append(f"health {oc:.0f}/{om:.0f} -> {nc:.0f}/{nm:.0f}")
+            if shield is not None:
+                oc, om, nc, nm = shield
+                parts.append(f"shield {oc:.0f}/{om:.0f} -> {nc:.0f}/{nm:.0f}")
+            level = enemy_level(enemy)
+            label = name if level is None else f"{name} (lvl {level})"
+            logging.info(f"[EnemyBalancer] {label}: {', '.join(parts)}")
+        except Exception as ex:  # noqa: BLE001
+            logging.dev_warning(f"[EnemyBalancer] could not nerf {name}: {ex!r}")
 
-            multiplier = nerf_multiplier_pct.value / 100.0
-
-            # Health: prefer HealthPool resource pool so we can adjust max too
-            health_pool = getattr(enemy, "HealthPool", None)
-            health_data = getattr(health_pool, "Data", None) if health_pool else None
-            if health_data:
-                old_health = health_data.GetCurrentValue()
-                old_max_health = health_data.GetMaxValue()
-
-                new_max_health = _nerf_value(old_max_health, multiplier)
-                new_health = _nerf_value(old_health, multiplier)
-
-                if (old_max_health or 0) > 0 and new_max_health is not None:
-                    try:
-                        health_data.MaxValue = new_max_health
-                    except Exception as e:
-                        logging.warning(f"  Health MaxValue set failed: {e}")
-
-                if (old_health or 0) > 0 and new_health is not None:
-                    try:
-                        health_data.SetCurrentValue(new_health)
-                    except Exception as e:
-                        logging.warning(f"  Health SetCurrentValue failed: {e}")
-
-                updated_health = health_data.GetCurrentValue()
-                updated_max_health = health_data.GetMaxValue()
-                logging.info(f"  Health: {old_health} -> {updated_health} / {old_max_health} -> {updated_max_health}")
-
-            # Shield: use ShieldArmor ResourcePoolReference if present
-            shield_ref = getattr(enemy, "ShieldArmor", None)
-            shield_data = getattr(shield_ref, "Data", None) if shield_ref else None
-            if shield_data:
-                old_shield = shield_data.GetCurrentValue()
-                old_max_shield = shield_data.GetMaxValue()
-
-                new_max_shield = _nerf_value(old_max_shield, multiplier)
-                new_shield = _nerf_value(old_shield, multiplier)
-
-                if (old_max_shield or 0) > 0 and new_max_shield is not None:
-                    try:
-                        shield_data.MaxValue = new_max_shield
-                    except Exception as e:
-                        logging.warning(f"  Shield MaxValue set failed: {e}")
-
-                if (old_shield or 0) > 0 and new_shield is not None:
-                    try:
-                        shield_data.SetCurrentValue(new_shield)
-                    except Exception as e:
-                        logging.warning(f"  Shield SetCurrentValue failed: {e}")
-
-                updated_shield = shield_data.GetCurrentValue()
-                updated_max_shield = shield_data.GetMaxValue()
-                logging.info(f"  Shield: {old_shield} -> {updated_shield} / {old_max_shield} -> {updated_max_shield}")
-
-        except Exception as e:
-            logging.error(f"  Error nerfing enemy: {e}")
-    logging.info(f"{len(enemies)} enemies nerfed.")
+    logging.info(
+        f"[EnemyBalancer] nerfed {nerfed} of {seen} enemies found to {nerf_percent.value}%"
+    )
 
 
-build_mod()
+mod = build_mod()
+
+# mods_base only restores a PREVIOUS enabled/disabled choice (auto_enable,
+# true by default) - it never starts a mod enabled the very first time, before
+# any choice has been made. default_load_mod_settings only calls .enable()
+# when a settings file already exists with "enabled": true; on a fresh
+# install there is no file yet, so is_enabled stays at its dataclass default
+# of False until the player opens the mod menu once. A missing settings file
+# is a reliable "never touched" signal precisely because mods_base only ever
+# writes one from an explicit enable/disable (or an option change) - nothing
+# saves it just for having loaded. So this fires exactly once, ever, and never
+# overrides an explicit disable made on any later launch.
+if mod.settings_file is not None and not mod.settings_file.exists():
+    mod.enable()

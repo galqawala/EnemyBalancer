@@ -1,13 +1,13 @@
 [project]
 name = "EnemyBalancer"
-version = "1.0.46"
+version = "1.0.52"
 description = "Nerfs enemy health&shield on respawn, preventing you from getting stuck while underleveled for example."
 [[project.authors]]
 name = "galqawala"
 
 [tool.sdkmod]
 name = "EnemyBalancer"
-supported_games = [ "BL1",]
+supported_games = [ "BL1", "BL1E", "BL2", "TPS",]
 coop_support = "ClientSide"
 download = "https://github.com/galqawala/EnemyBalancer/raw/refs/heads/main/EnemyBalancer.sdkmod"
 

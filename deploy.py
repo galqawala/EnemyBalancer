@@ -49,7 +49,61 @@ def create_zip():
     return zip_name
 
 
+# Every mods_base.Game value this machine has an install for. Not every game a
+# mod could declare in supported_games necessarily has an entry here (e.g.
+# AoDK, BL3+ are not installed on this machine) - install_to_supported_games
+# warns rather than fails when a declared game has no known or no existing
+# folder, since that is a fact about this machine, not about the mod.
+STEAM_COMMON = Path("C:/Program Files (x86)/Steam/steamapps/common")
+GAME_INSTALL_FOLDERS = {
+    "BL1": STEAM_COMMON / "Borderlands",
+    "BL1E": STEAM_COMMON / "BorderlandsGOTYEnhanced",
+    "BL2": STEAM_COMMON / "Borderlands 2",
+    "TPS": STEAM_COMMON / "BorderlandsPreSequel",
+}
+
+
+def read_supported_games() -> list[str]:
+    content = Path("pyproject.toml").read_text()
+    match = re.search(r"supported_games\s*=\s*\[([^\]]*)\]", content)
+    if not match:
+        print("supported_games not found in pyproject.toml")
+        return []
+    return re.findall(r'"([^"]+)"', match.group(1))
+
+
+def install_to_supported_games(zip_name: str):
+    """Copy the built .sdkmod (and any verify_*.py) into every game folder
+    this mod declares support for, deriving the list fresh from
+    pyproject.toml each run rather than from a remembered set of folders -
+    the set of supported games changes over a mod's life and each deploy must
+    reflect whatever it says right now.
+    """
+    games = read_supported_games()
+    if not games:
+        print("No supported_games to install to")
+        return
+
+    extra_files = sorted(Path.cwd().glob("verify_*.py"))
+
+    for game in games:
+        folder = GAME_INSTALL_FOLDERS.get(game)
+        if folder is None:
+            print(f"  {game}: skipped, no known install folder for this machine")
+            continue
+        sdk_mods = folder / "sdk_mods"
+        if not sdk_mods.is_dir():
+            print(f"  {game}: skipped, {sdk_mods} does not exist")
+            continue
+
+        shutil.copy(zip_name, sdk_mods / zip_name)
+        for extra in extra_files:
+            shutil.copy(extra, sdk_mods / extra.name)
+        print(f"  {game}: installed to {sdk_mods}")
+
+
 if __name__ == "__main__":
     delete_logs()
     increment_version()
-    create_zip()
+    zip_name = create_zip()
+    install_to_supported_games(zip_name)
