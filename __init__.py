@@ -22,12 +22,13 @@ confirmed against a decompiled BL1E dump the way BL1/BL2/TPS were.
 
 import unrealsdk
 from mods_base import SliderOption, build_mod, get_pc, hook
+from ui_utils import show_hud_message
 from unrealsdk import logging
 from unrealsdk.hooks import Type
 
 nerf_percent = SliderOption(
     "Health/Shield Multiplier (%)",
-    95,
+    88,
     1,
     99,
     1,
@@ -88,12 +89,28 @@ def nerf_resource_pool(pool_ref, multiplier):
     return old_current, old_max, new_current, new_max
 
 
-def iter_enemy_pawns():
-    """Every pawn currently under AI control, via WillowMind.Pawn."""
+def iter_enemy_pawns(player_pawn):
+    """Every living, hostile pawn currently under AI control.
+
+    unrealsdk.find_all("WillowMind") returns EVERY AI-controlled pawn, not
+    just enemies - companion pets/turrets, neutral critters and lingering
+    corpses all have a WillowMind too. Those were previously counted as
+    "found" but never nerfed (no health pool, or already at 0), which made
+    the "nerfed X of Y" log read as if live enemies were being skipped.
+    Pawn.IsDead() and Pawn.IsEnemy() are native Engine.Pawn functions -
+    shared engine-level plumbing, not Gearbox gameplay script - so this
+    filter is as safe as the HealthPool/ShieldArmor access below it.
+    """
     for mind in unrealsdk.find_all("WillowMind"):
         pawn = mind.Pawn
-        if pawn is not None:
-            yield pawn
+        if pawn is None:
+            continue
+        try:
+            if pawn.IsDead() or not pawn.IsEnemy(player_pawn):
+                continue
+        except Exception:  # noqa: BLE001
+            pass
+        yield pawn
 
 
 def enemy_display_name(enemy) -> str:
@@ -145,7 +162,7 @@ def on_show_respawn_dialog(_obj, _args, _ret, _func):
     multiplier = nerf_percent.value / 100.0
     seen = 0
     nerfed = 0
-    for enemy in iter_enemy_pawns():
+    for enemy in iter_enemy_pawns(pc.Pawn):
         seen += 1
         name = enemy_display_name(enemy)
         try:
@@ -173,6 +190,17 @@ def on_show_respawn_dialog(_obj, _args, _ret, _func):
 
     logging.info(
         f"[EnemyBalancer] nerfed {nerfed} of {seen} enemies found to {nerf_percent.value}%"
+    )
+
+    # "of seen" is only shown when it actually diverges from nerfed (a
+    # found enemy whose health/shield pools were both empty right then, or
+    # threw while being read) - otherwise it's just noise, since seen no
+    # longer counts allies/critters/corpses after the iter_enemy_pawns filter.
+    if seen == 0:
+        return
+    count_text = str(nerfed) if nerfed == seen else f"{nerfed} of {seen}"
+    show_hud_message(
+        "EnemyBalancer", f"Nerfed {count_text} enemies to {nerf_percent.value}%"
     )
 
 
