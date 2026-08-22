@@ -1,14 +1,14 @@
 [project]
 name = "EnemyBalancer"
-version = "1.0.54"
-description = "Nerfs enemy health&shield on respawn, preventing you from getting stuck while underleveled for example."
+version = "1.0.75"
+description = "Scales enemy level to your own level plus an offset, on respawn and on spawn, preventing you from getting stuck while underleveled for example."
 [[project.authors]]
 name = "galqawala"
 
 [tool.sdkmod]
 name = "EnemyBalancer"
 supported_games = [ "BL1", "BL1E", "BL2", "TPS",]
-coop_support = "ClientSide"
+coop_support = "HostOnly"
 download = "https://github.com/galqawala/EnemyBalancer/raw/refs/heads/main/EnemyBalancer.sdkmod"
 
 [tool.sdkmod.license]

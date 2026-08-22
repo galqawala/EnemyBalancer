@@ -6,16 +6,8 @@ somewhere in the loaded level - your distance from them does not matter,
 
     pyexec verify_enemybalancer.py
 
-The real constraint is not distance but existence: the mod can only touch
-enemies that are already alive (already exist as objects) at the moment you die. Anything
-a population trigger has not yet created (e.g. an on-approach spawn point you
-have not reached) is not nerfable, because it does not exist yet - dying again
-after it appears will still catch it.
-
 Every call below only reads state or does pure arithmetic. It never calls
-nerf_resource_pool or the respawn-dialog hook on a real enemy, so no enemy's
-health or shield is actually touched. The functions that DO change state are
-checked for existence only, by name.
+SetGameStage on a real enemy, so no enemy's level is actually touched.
 
 This exists because a mock of the engine can only confirm what the mod's
 author already believed about it - see AutoLoot's verify_autoloot.py and the
@@ -77,17 +69,16 @@ def main():
     )
 
     section("logic checks - real function, values worked out by hand")
-    # 1000 * 0.95 = 950, minus 1 = 949
-    check("nerf_value(1000, 0.95)", enemybalancer.nerf_value(1000, 0.95), 949)
-    # 100 * 0.99 = 99, minus 1 = 98
-    check("nerf_value(100, 0.99)", enemybalancer.nerf_value(100, 0.99), 98)
-    # 1 * 0.01 = 0, minus 1 = -1, clamped to the floor of 1
-    check("nerf_value(1, 0.01) floors at 1", enemybalancer.nerf_value(1, 0.01), 1)
-    check("nerf_value(None, 0.95) is None", enemybalancer.nerf_value(None, 0.95), None)
-    check("nerf_value('nope', 0.95) is None", enemybalancer.nerf_value("nope", 0.95), None)
+    check("target_game_stage(30, -3, None)", enemybalancer.target_game_stage(30, -3, None), 27)
+    check("target_game_stage(5, -3, None) floors at 1", enemybalancer.target_game_stage(5, -3, None), 1)
+    check("target_game_stage(1, -30, None) floors at 1", enemybalancer.target_game_stage(1, -30, None), 1)
+    check("target_game_stage(20, 5, None)", enemybalancer.target_game_stage(20, 5, None), 25)
+    check("target_game_stage(0, 0, None) floors at 1", enemybalancer.target_game_stage(0, 0, None), 1)
+    check("target_game_stage(20, 50, 40) caps at 40", enemybalancer.target_game_stage(20, 50, 40), 40)
+    check("target_game_stage(5, -30, 40) floor beats cap", enemybalancer.target_game_stage(5, -30, 40), 1)
 
     section("current settings")
-    show("Health/Shield Multiplier (%)", enemybalancer.nerf_percent.value)
+    show("Enemy Level Offset", enemybalancer.level_offset.value)
     mod = getattr(enemybalancer, "mod", None)
     if mod is not None:
         show("mod.is_enabled", mod.is_enabled)
@@ -101,6 +92,26 @@ def main():
             "if this is a fresh install and is_enabled is already True with no"
             " settings file yet, the enable-on-first-run logic did its job",
         )
+
+    section("your own level")
+    # player_level() reads PlayerReplicationInfo.ExpLevel off the
+    # controller, NOT pc.Pawn.GetGameStage() - the latter breaks while
+    # driving a vehicle (pc.Pawn becomes the vehicle actor), confirmed live
+    # (2026-08-22) to silently scale every enemy to level 1 as a result.
+    plevel = None
+    level_cap = None
+    if pc is not None:
+        attempt("player_level(pc)", lambda: enemybalancer.player_level(pc))
+        attempt("max_expected_level(pc)", lambda: enemybalancer.max_expected_level(pc))
+        plevel = enemybalancer.player_level(pc)
+        level_cap = enemybalancer.max_expected_level(pc)
+        if plevel is not None:
+            target = enemybalancer.target_game_stage(plevel, enemybalancer.level_offset.value, level_cap)
+            show("would scale enemies to", target)
+    else:
+        show("", "!! no live player controller - cannot read your level")
+    if pc is not None and pc.Pawn is not None:
+        show("pc.Pawn.Class.Name (sanity check)", getattr(getattr(pc.Pawn, "Class", None), "Name", "?"))
 
     section("enemies in the level right now")
     minds = []
@@ -117,7 +128,6 @@ def main():
     if minds and not pawns:
         show("", "!! SUSPECT: WillowMind objects exist but none have a Pawn")
 
-    multiplier = enemybalancer.nerf_percent.value / 100.0
     shown = 0
     for pawn in pawns:
         if shown >= 5:
@@ -125,8 +135,16 @@ def main():
         shown += 1
         name = enemybalancer.enemy_display_name(pawn)
         class_name = getattr(getattr(pawn, "Class", None), "Name", "?")
-        level = enemybalancer.enemy_level(pawn)
-        section(f"sample enemy {shown}: {name} lvl {level} (class {class_name})")
+        game_stage = enemybalancer.pawn_game_stage(pawn)
+        exp_level = enemybalancer.pawn_exp_level(pawn)
+        section(f"sample enemy {shown}: {name} lvl {exp_level} (class {class_name})")
+        if game_stage != exp_level:
+            show("!! game stage vs exp level disagree", f"stage={game_stage}, exp={exp_level}")
+
+        if plevel is not None:
+            target = enemybalancer.target_game_stage(plevel, enemybalancer.level_offset.value, level_cap)
+            already_there = game_stage == target and exp_level == target
+            show("would be scaled to", f"{target} (already there)" if already_there else target)
 
         health_pool = getattr(pawn, "HealthPool", None)
         health_data = getattr(health_pool, "Data", None) if health_pool else None
@@ -136,13 +154,6 @@ def main():
             attempt("  HealthPool current/max", lambda d=health_data: (
                 d.GetCurrentValue(), d.GetMaxValue()
             ))
-            attempt(
-                "  would become (current/max)",
-                lambda d=health_data: (
-                    enemybalancer.nerf_value(d.GetCurrentValue(), multiplier),
-                    enemybalancer.nerf_value(d.GetMaxValue(), multiplier),
-                ),
-            )
 
         shield_ref = getattr(pawn, "ShieldArmor", None)
         shield_data = getattr(shield_ref, "Data", None) if shield_ref else None
@@ -152,18 +163,12 @@ def main():
             attempt("  ShieldArmor current/max", lambda d=shield_data: (
                 d.GetCurrentValue(), d.GetMaxValue()
             ))
-            attempt(
-                "  would become (current/max)",
-                lambda d=shield_data: (
-                    enemybalancer.nerf_value(d.GetCurrentValue(), multiplier),
-                    enemybalancer.nerf_value(d.GetMaxValue(), multiplier),
-                ),
-            )
 
     section("mutating calls - existence only, never invoked here")
     for label, present in (
-        ("nerf_resource_pool", hasattr(enemybalancer, "nerf_resource_pool")),
         ("on_show_respawn_dialog", hasattr(enemybalancer, "on_show_respawn_dialog")),
+        ("on_create_ai_pawn", hasattr(enemybalancer, "on_create_ai_pawn")),
+        ("on_create_vehicle", hasattr(enemybalancer, "on_create_vehicle")),
     ):
         show(label, "present" if present else "!! MISSING")
 
@@ -172,7 +177,7 @@ def main():
         print(f"{len(FAILURES)} LOGIC CHECK(S) FAILED: {', '.join(FAILURES)}")
     else:
         print("All logic checks passed.")
-    print("Done. Nothing was changed, and no enemy was actually nerfed.")
+    print("Done. Nothing was changed, and no enemy was actually scaled.")
     print("=" * 72)
 
 
